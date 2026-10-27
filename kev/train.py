@@ -208,28 +208,54 @@ def microbatch_plan(reqs, a, world, rank, pairs=None, shapes=None):
                 for mb in range(n)]
     ceiling = a.pass_tokens_max if shapes is not None else 0
     if shapes is None:
-        shapes = {id(r): [(len(json.dumps(r["state"], ensure_ascii=False)), [len(json.dumps(q, ensure_ascii=False)) for q in r["questions"].values()])] for r in reqs}
+        dumps = json.JSONEncoder(ensure_ascii=False).encode   # json.dumps(x, ensure_ascii=False) without a new encoder per call
+        shapes = {id(r): [(len(dumps(r["state"])), [len(dumps(q)) for q in r["questions"].values()])] for r in reqs}
         for r in reqs if pairs else ():
             if id(r) in pairs:   # a sibling: the state again with one Choice (at most the longest) and a none option
-                choice = max(len(json.dumps(q, ensure_ascii=False)) for q in r["questions"].values() if q["type"] == "choice")
+                choice = max(n for n, q in zip(shapes[id(r)][0][1], r["questions"].values()) if q["type"] == "choice")
                 shapes[id(r)] += [(shapes[id(r)][0][0], [choice + NONE_OPTION_CHARS])] * 2
-    cost = lambda rs: pass_tokens([s for r in rs for s in shapes[id(r)]], a.shared_prefix)
-    if ceiling and (over := [r for r in reqs if cost([r]) > ceiling]):
-        worst = max(over, key=lambda r: cost([r]))
+    def summary(ss):   # what pass_tokens reads of a record's shapes; None when a pass of it alone has no longest branch / row
+        if a.shared_prefix:
+            branches = [x for _, b in ss for x in b]
+            return (len(ss), max(s for s, _ in ss), len(branches), max(branches)) if branches else None
+        rows = [s + x for s, b in ss for x in b]
+        return (len(rows), max(rows)) if rows else None
+    stats = {id(r): summary(shapes[id(r)]) for r in reqs}
+    memo = {}   # balanced_runs' cuts cost the same runs again and again: one entry per run (tuple of record ids)
+    def cost(rs):   # pass_tokens of the records' shapes together, from their summaries
+        key = tuple(map(id, rs))
+        if (c := memo.get(key)) is None:
+            st = [stats[k] for k in key]
+            if not st or None in st:   # pass_tokens itself (and its error for a pass with no branch / row), remembered when it returns
+                c = memo[key] = pass_tokens([s for r in rs for s in shapes[id(r)]], a.shared_prefix)
+            elif a.shared_prefix:
+                n, s, b, x = zip(*st)
+                c = memo[key] = sum(n) * max(s) + sum(b) * max(x)
+            else:
+                b, x = zip(*st)
+                c = memo[key] = sum(b) * max(x)
+        return c
+    # every record's cost alone in one pass over the summaries, seeding the run memo with the one-record runs
+    single = {k: (st[0] * st[1] + st[2] * st[3] if a.shared_prefix else st[0] * st[1]) for k, st in stats.items() if st is not None}
+    memo.update(((k,), c) for k, c in single.items())
+    single.update((id(r), cost([r])) for r in reqs if id(r) not in single)
+    alone = lambda r: single[id(r)]
+    if ceiling and (over := [r for r in reqs if alone(r) > ceiling]):
+        worst = max(over, key=alone)
         raise ValueError(f"{len(over)} record(s) need more than --pass_tokens_max {ceiling} padded tokens on their own (the largest, "
-                         f"{worst['_meta']['id']}, {cost([worst])}): raise the ceiling or lower --max_state")
+                         f"{worst['_meta']['id']}, {alone(worst)}): raise the ceiling or lower --max_state")
     plan, per_step = [], a.batch * a.accum * world
     for start in range(0, len(reqs), per_step):
         step = reqs[start:start + per_step]
         m = math.ceil(len(step) / (world * a.batch))   # micro-batches per rank: accum, fewer in a short last step
         step += step[:max(0, world * m - len(step))]    # so no micro-batch is empty; the repeats count in len(step), the
                                                          # step's loss normaliser, as rank_share's do in the plain path
-        runs = balanced_runs(sorted(step, key=lambda r: cost([r]), reverse=True), world * m, cost)
+        runs = balanced_runs(sorted(step, key=alone, reverse=True), world * m, cost)
         while ceiling and max(map(cost, runs)) > ceiling:   # ends: world * m runs of one record each are all within it
             m += 1
             # a step with fewer records than runs (a short last step) repeats its cheapest, counted like the fill above
-            step += sorted(step, key=lambda r: cost([r]))[:max(0, world * m - len(step))]
-            runs = balanced_runs(sorted(step, key=lambda r: cost([r]), reverse=True), world * m, cost)
+            step += sorted(step, key=alone)[:max(0, world * m - len(step))]
+            runs = balanced_runs(sorted(step, key=alone, reverse=True), world * m, cost)
         runs = sorted(runs, key=cost, reverse=True)
         plan += [(runs[k * world + rank], len(step), k == m - 1) for k in range(m)]
     return plan

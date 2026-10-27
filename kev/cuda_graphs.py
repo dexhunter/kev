@@ -59,8 +59,10 @@ HOT_BUCKET = 3         # eager passes after which a busy server captures a bucke
 def bucket(n, steps=8, floor=16):
     """n rounded up to one of `steps` steps per power of two, in steps of at least `floor`: the padding adds less than
     2/steps of n (just past a power of two, one step is almost that), or less than `floor` tokens for short n."""
-    step = max(floor, (1 << (n - 1).bit_length()) // steps)
-    return -(-n // step) * step
+    step = (1 << (n - 1).bit_length()) // steps
+    if step > floor:
+        return -(-n // step) * step
+    return -(-n // floor) * floor
 
 
 def pow2(n):
